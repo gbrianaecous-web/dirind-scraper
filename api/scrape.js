@@ -1,6 +1,4 @@
 import * as cheerio from "cheerio";
-
-// Optional: enforce Node 18 on Vercel
 export const config = { runtime: "nodejs18.x" };
 
 export default async function handler(req, res) {
@@ -10,22 +8,15 @@ export default async function handler(req, res) {
 
     const r = await fetch(url, { headers: { "user-agent": "Mozilla/5.0" } });
     const html = await r.text();
+    const $ = cheerio.load(html);
 
-    // Normalize HTML to keep paragraph/line breaks
-    const normalized = html
-      .replace(/<br\s*\/?>/gi, "\n")
-      .replace(/<\/p>/gi, "\n\n");
-
-    const $ = cheerio.load(normalized);
-    const text = $.root().text();
-    const blocks = text.split(/\n{2,}/g).map(b => b.trim()).filter(Boolean);
-
-    // Regex helpers
+    // --- helpers ---
     const emailRe = /\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b/ig;
-    const phoneRe = /\(\d{2,3}\)\s?\d{3,4}[-\s]?\d{4}|\b\d{3,4}[-\s]?\d{4}\b/g;
-    const urlRe   = /\bhttps?:\/\/[^\s]+|\bwww\.[^\s]+/ig;
+    const phoneRe = /(?:\+?52[\s-]?)?(?:\(?\d{2,3}\)?[\s-]?)?\d{3,4}[\s-]?\d{4}/g;
+    const urlRe   = /\bhttps?:\/\/[^\s<>"']+|\bwww\.[^\s<>"']+/ig;
+    const tidy = s => (s||"").replace(/\s+/g," ").trim();
+    const toTitle = s => tidy(s).replace(/\b\w/g, c => c.toUpperCase());
 
-    // Page meta
     const category = (/\/dap\/([^\/]+)\d*\.html/i.exec(url)||[])[1] || "unknown";
     const guessLang = s => /[áéíóúñ]/i.test(s) ? "es" : "en";
     const scoreFit = d => {
@@ -35,90 +26,100 @@ export default async function handler(req, res) {
       return "General filtration";
     };
 
-    // --- Name cleaning helpers ---
-    const GENERIC = new Set([
-      "gmail","hotmail","outlook","live","icloud","aol","yahoo",
-      "gmx","msn","yopmail","prodigy","telmex","att","icloud","me"
-    ]);
+    // ---------- FIND CARDS: orange + grey ----------
+    const cardSet = new Set();
+    const cards = [];
 
-    const toTitle = s =>
-      s.replace(/\s+/g," ").trim()
-       .replace(/\b\w/g, c => c.toUpperCase());
+    // A) Orange: by "Cotizar" anchor
+    $("a").filter((i,el)=>$(el).text().trim().toLowerCase()==="cotizar")
+      .each((i,a)=>{
+        const parent = $(a).closest("table, tbody, tr, div").first();
+        if (parent && parent.length) {
+          const key = parent[0]; if (!cardSet.has(key)) { cardSet.add(key); cards.push(parent); }
+        }
+      });
 
-    const secondLevel = host => {
-      // get second-level segment: foo.bar.baz -> bar (best-effort)
-      const parts = (host||"").toLowerCase().replace(/^www\./,"").split(".");
-      if (parts.length <= 2) return parts[0] || "";
-      return parts[parts.length - 2];
-    };
+    // B) Grey: any table/div that contains Tel:
+    $("table, div").filter((i,el)=>{
+      const t = $(el).text();
+      return /\bTel\.?:/i.test(t) && t.length > 120; // avoid tiny fragments
+    }).each((i,el)=>{
+      const parent = $(el).closest("table").length ? $(el).closest("table") : $(el);
+      const key = parent[0]; if (!cardSet.has(key)) { cardSet.add(key); cards.push(parent); }
+    });
 
-    const domainFromUrl = u => {
-      try {
-        const d = new URL(/^https?:\/\//i.test(u) ? u : `http://${u}`).hostname;
-        return d.replace(/^www\./,"");
-      } catch { return ""; }
-    };
-
-    const companyFromDomain = d => {
-      const sld = secondLevel(d);
-      if (!sld || GENERIC.has(sld)) return "";
-      return toTitle(sld.replace(/[-_]/g, " "));
-    };
-
-    function extractCompanyName(lines, blockText, websites, emails){
-      // 1) Try first non-label line that looks like a name
-      for (const ln of lines) {
-        if (/^(tel|teléfono|email|e-mail|correo|web)\s*:/i.test(ln)) continue;
-        if (/@|https?:\/\//i.test(ln)) continue;
-        if (ln.trim().length > 3) return toTitle(ln.trim());
-      }
-      // 2) Try website domain
-      const site = (websites || "").split(";")[0]?.trim();
-      const siteDom = site ? domainFromUrl(site) : "";
-      const siteName = companyFromDomain(siteDom);
-      if (siteName) return siteName;
-
-      // 3) Try email domain
-      const em = (emails || "").split(";")[0]?.trim();
-      const emDom = em.includes("@") ? em.split("@")[1] : "";
-      const emailName = companyFromDomain(emDom);
-      if (emailName) return emailName;
-
-      // 4) Last resort: any domain-like text in block
-      const anyDom = (blockText.match(/[a-z0-9-]+(?:\.[a-z0-9-]+)+/i)||[])[0] || "";
-      const anyName = companyFromDomain(anyDom);
-      return anyName || "";
+    // de-dup nested containers by choosing the smallest with Tel:
+    const uniq = [];
+    for (const c of cards) {
+      if (!uniq.some(u => u[0] === c[0] || $.contains(u[0], c[0]) )) uniq.push(c);
     }
 
-    // ---- Build items ----
     const items = [];
     const seen = new Set();
 
-    for (const b of blocks) {
-      if (!/(email|e-mail|correo)\s*:/i.test(b)) continue;
+    for (const card of uniq) {
+      const $card = $(card);
 
-      const lines = b.split(/\n/).map(s => s.trim()).filter(Boolean);
+      // ---------- COMPANY NAME ----------
+      // Look for a short, likely-header line at the top of the card (often ALL CAPS)
+      const lines = $card.text().split("\n").map(t=>t.trim()).filter(Boolean);
+      let headerIdx = 0;
+      // heuristics: line before "Tel:" block, all caps-ish, not starting with labels
+      const labelRe = /^(tel\.?|whatsapp|email|web|productos?)/i;
+      for (let i=0;i<Math.min(8, lines.length);i++){
+        const L = lines[i];
+        if (labelRe.test(L)) break;
+        if (L.length >= 3 && L.length <= 80) { headerIdx = i; break; }
+      }
+      let company_name = lines[headerIdx] || "";
+      company_name = company_name.replace(/\s*\b(cotizar)\b.*$/i,"").trim();
+      if (!company_name) {
+        // fallback: first strong/b text
+        company_name = tidy($card.find("strong,b").first().text());
+      }
+      company_name = toTitle(company_name);
 
-      const emailsArr = (b.match(emailRe)||[]).filter((v,i,a)=>a.indexOf(v)===i);
-      const phonesArr = (b.match(phoneRe)||[]).filter((v,i,a)=>a.indexOf(v)===i);
-      const urlsArr   = (b.match(urlRe)||[])
-        .map(u=>u.replace(/[,;.]$/,""))
-        .filter((v,i,a)=>a.indexOf(v)===i);
+      // ---------- DESCRIPTION ----------
+      // first paragraph-ish text chunk before labels
+      let description = "";
+      for (let i = headerIdx+1; i < Math.min(headerIdx+6, lines.length); i++){
+        if (labelRe.test(lines[i])) break;
+        if ((lines[i]||"").length > 40) { description = lines[i]; break; }
+      }
 
-      const emails   = emailsArr.join("; ");
-      const phones   = phonesArr.join("; ");
-      const websites = urlsArr.join("; ");
+      // ---------- LABELED FIELDS ----------
+      const text = $card.text();
+      const emails = Array.from(new Set((text.match(emailRe)||[]))).join("; ");
+      const phones = Array.from(new Set((text.match(phoneRe)||[]))).join("; ");
+      const websites = Array.from(new Set((text.match(urlRe)||[]))).join("; ");
 
-      const cut = lines.findIndex(l => /^(tel|teléfono|email|e-mail|correo|web)\s*:/i.test(l));
-      const description = lines.slice(1, cut > 0 ? cut : lines.length).join(" ").trim();
+      // WhatsApp explicit
+      let whatsapp = "";
+      const whatsLine = (text.match(/WhatsApp\s*:\s*([^\n\r]+)/i)||[])[1];
+      if (whatsLine) {
+        const wPhones = whatsLine.match(phoneRe)||[];
+        if (wPhones.length) whatsapp = wPhones.join("; ");
+      }
 
-      const lastLines = lines.slice(-4).join(" ");
-      const address = /(Col\.|Colonia|CP|C\.P\.|CDMX|Jal\.|NL|Querétaro|Monterrey|Guadalajara|México|Mexico)/i.test(lastLines) ? lastLines : "";
+      // Address: pick right-hand / tail lines with place cues
+      const tail = lines.slice(-10);
+      const looksAddr = s => s && !/@/i.test(s) && (/\d/.test(s) || /c\.?p\.?|cp\s?\d{4,5}/i.test(s)) &&
+        /(calle|av\.?|avenida|col\.?|parque|cdmx|méxico|quer[eé]taro|toluca|guadalajara|monterrey|puebla|edo\.?\s?mex|edomex|jal\.?|nl)/i.test(s);
+      const address = tail.filter(looksAddr).join(" | ");
 
-      let company_name = extractCompanyName(lines, b, websites, emails);
+      // Products (optional)
+      let products = "";
+      const htmlFrag = $card.html() || "";
+      const prodBlock = htmlFrag.split(/Productos?:/i)[1];
+      if (prodBlock) {
+        const short = prodBlock.split(/<\/(div|table)>|<hr|<br\s*\/?>\s*<br\s*\/?>/i)[0] || prodBlock;
+        const raw = cheerio.load("<root>"+short+"</root>")("root").text();
+        const entries = raw.split(/\n|•|-\s+/).map(t=>t.trim()).filter(t => t && t.length > 2 && !/^cotizar$/i.test(t));
+        products = Array.from(new Set(entries)).slice(0, 20).join("; ");
+      }
 
-      // Simple de-dupe by name+firstEmail
-      const key = `${(company_name||"").toLowerCase()}|${(emailsArr[0]||"").toLowerCase()}`;
+      // de-dupe
+      const key = `${company_name.toLowerCase()}|${(emails.split(";")[0]||"").toLowerCase()}`;
       if (seen.has(key)) continue;
       seen.add(key);
 
@@ -127,12 +128,14 @@ export default async function handler(req, res) {
         description,
         emails,
         phones,
+        whatsapp,
         websites,
         address,
+        products,
         category,
         category_url: url,
-        lang: guessLang(b),
-        fit_hint: scoreFit(description || b),
+        lang: guessLang(text),
+        fit_hint: scoreFit(description || text),
         notes: ""
       });
     }
